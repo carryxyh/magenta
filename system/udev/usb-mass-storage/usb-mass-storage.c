@@ -499,11 +499,6 @@ static mx_status_t ums_toggle_removable(mx_device_t* device, bool removable) {
 
 static void ums_unbind(mx_device_t* device) {
     ums_t* msd = get_ums(device);
-    device_remove(&msd->device);
-}
-
-static mx_status_t ums_release(mx_device_t* device) {
-    ums_t* msd = get_ums(device);
 
     // terminate our worker thread
     mtx_lock(&msd->iotxn_lock);
@@ -511,6 +506,11 @@ static mx_status_t ums_release(mx_device_t* device) {
     mtx_unlock(&msd->iotxn_lock);
     completion_signal(&msd->iotxn_completion);
     thrd_join(msd->worker_thread, NULL);
+    // worker thread will call device_remove for us before it terminates
+}
+
+static mx_status_t ums_release(mx_device_t* device) {
+    ums_t* msd = get_ums(device);
 
     if (msd->cbw_iotxn) {
         iotxn_release(msd->cbw_iotxn);
@@ -646,49 +646,22 @@ static block_ops_t msd_block_ops = {
     .write = msd_async_write,
 };
 
-static int ums_worker_thread(void* arg) {
-    ums_t* msd = (ums_t*)arg;
-    device_init(&msd->device, msd->driver, "usb_mass_storage", &ums_device_proto);
-
-    // we need to send the Inquiry command first,
-    // but currently we do not do anything with the response
-    uint8_t inquiry_data[UMS_INQUIRY_TRANSFER_LENGTH];
-    mx_status_t status = ums_inquiry(msd, inquiry_data);
-    if (status < 0) {
-        printf("ums_inquiry failed: %d\n", status);
-        goto fail;
+static mx_status_t ums_check_ready(ums_t* msd) {
+    mx_status_t status = ums_test_unit_ready(msd);
+    if (status == ERR_BAD_STATE) {
+        // command returned CSW_FAILED. device is there but media is not ready.
+        uint8_t request_sense_data[UMS_REQUEST_SENSE_TRANSFER_LENGTH];
+        status = ums_request_sense(msd, request_sense_data);
     }
+    return status;
+}
 
-    bool ready = false;
-    for (int i = 0; i < 100; i++) {
-        status = ums_test_unit_ready(msd);
-        if (status == NO_ERROR) {
-            ready = true;
-            break;
-        } else if (status != ERR_BAD_STATE) {
-            printf("ums_test_unit_ready failed: %d\n", status);
-            goto fail;
-        } else {
-            uint8_t request_sense_data[UMS_REQUEST_SENSE_TRANSFER_LENGTH];
-            status = ums_request_sense(msd, request_sense_data);
-            if (status != NO_ERROR) {
-                printf("request_sense_data failed: %d\n", status);
-                goto fail;
-            }
-            // wait a bit before trying ums_test_unit_ready again
-            usleep(100 * 1000);
-        }
-    }
-    if (!ready) {
-        printf("gave up waiting for ums_test_unit_ready to succeed\n");
-        goto fail;
-    }
-
+static mx_status_t ums_add_block_device(ums_t* msd) {
     scsi_read_capacity_10_t data;
-    status = ums_read_capacity10(msd, &data);
+    mx_status_t status = ums_read_capacity10(msd, &data);
     if (status < 0) {
         printf("read_capacity10 failed: %d\n", status);
-        goto fail;
+        return status;
     }
 
     msd->total_blocks = betoh32(data.lba);
@@ -699,7 +672,7 @@ static int ums_worker_thread(void* arg) {
         status = ums_read_capacity16(msd, &data);
         if (status < 0) {
             printf("read_capacity16 failed: %d\n", status);
-            goto fail;
+            return status;
         }
 
         msd->total_blocks = betoh64(data.lba);
@@ -707,8 +680,7 @@ static int ums_worker_thread(void* arg) {
     }
     if (msd->block_size == 0) {
         printf("UMS zero block size\n");
-        status = ERR_INVALID_ARGS;
-        goto fail;
+        return ERR_INVALID_ARGS;
     }
 
     // +1 because this returns the address of the final block, and blocks are zero indexed
@@ -722,18 +694,65 @@ static int ums_worker_thread(void* arg) {
     DEBUG_PRINT(("UMS:total size is: %" PRId64 "\n", msd->total_blocks * msd->block_size));
     msd->device.protocol_id = MX_PROTOCOL_BLOCK_CORE;
     msd->device.protocol_ops = &msd_block_ops;
-    status = device_add(&msd->device, msd->udev);
-    if (status != NO_ERROR) {
-        printf("ums device_add failed: %d\n", status);
+
+    device_init(&msd->device, msd->driver, "usb_mass_storage", &ums_device_proto);
+    return device_add(&msd->device, msd->udev);
+}
+
+static int ums_worker_thread(void* arg) {
+    ums_t* msd = (ums_t*)arg;
+    bool block_device_added = false;
+
+    // we need to send the Inquiry command first,
+    // but currently we do not do anything with the response
+    uint8_t inquiry_data[UMS_INQUIRY_TRANSFER_LENGTH];
+    mx_status_t status = ums_inquiry(msd, inquiry_data);
+    if (status < 0) {
+        printf("ums_inquiry failed: %d\n", status);
         goto fail;
     }
 
     while (1) {
-        completion_wait(&msd->iotxn_completion, MX_TIME_INFINITE);
+top:
+        while (!block_device_added) {
+            status = ums_check_ready(msd);
+            if (status == NO_ERROR) {
+                status = ums_add_block_device(msd);
+                if (status == NO_ERROR) {
+                    block_device_added = true;
+                }
+            } else if (status == ERR_BAD_STATE) {
+                // try again in one second
+                sleep(1);
+                continue;
+            }
+            if (status != NO_ERROR) {
+                goto fail;
+            }
+        }
+
+        do {
+            status = completion_wait(&msd->iotxn_completion, MX_SEC(1));
+            if (status == ERR_TIMED_OUT) {
+                status = ums_check_ready(msd);
+                if (status == ERR_BAD_STATE) {
+                    printf("UMS: media gone\n");
+                    device_remove(&msd->device);
+                    block_device_added = false;
+                    goto top;
+                } else if (status != NO_ERROR) {
+                    goto fail;
+                }
+            }
+                
+        } while (status != NO_ERROR);
 
         mtx_lock(&msd->iotxn_lock);
         if (msd->dead) {
             mtx_unlock(&msd->iotxn_lock);
+            if (block_device_added) {
+                device_remove(&msd->device);
+            }
             return 0;
         }
         iotxn_t* txn = list_remove_head_type(&msd->queued_iotxns, iotxn_t, node);
@@ -775,7 +794,10 @@ static int ums_worker_thread(void* arg) {
     }
 
 fail:
-    printf("ums initialization failed\n");
+    printf("ums_worker_thread failed\n");
+    if (block_device_added) {
+        device_remove(&msd->device);
+    }
     ums_release(&msd->device);
     return status;
 }
