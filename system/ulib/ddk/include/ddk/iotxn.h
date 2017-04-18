@@ -124,6 +124,14 @@ struct iotxn {
     void (*release_cb)(iotxn_t* txn);
 };
 
+// used to iterate over contiguous buffer ranges in the physical address space
+typedef struct {
+    iotxn_t*    txn;        // txn we are operating on
+    mx_off_t    offset;     // current offset in the txn (relative to iotxn vmo_offset)
+    uint64_t    page;       // index of page in txn->phys that contains offset
+    uint64_t    last_page;  // last valid page index in txn->phys
+} iotxn_phys_iter_t;
+
 #define iotxn_pdata(txn, type) ((type*) (txn)->protocol_data)
 
 // flags for iotxn_alloc
@@ -201,5 +209,15 @@ mx_status_t iotxn_clone_partial(iotxn_t* txn, uint64_t vmo_offset, mx_off_t leng
 
 // free the iotxn -- should be called only by the entity that allocated it
 void iotxn_release(iotxn_t* txn);
+
+// initializes an iotxn_phys_iter_t for an iotxn
+void iotxn_phys_iter_init(iotxn_phys_iter_t* iter, iotxn_t* txn);
+
+// returns the next physical address and length for the iterator up to size max_length
+// if vmo_offset is unaligned, on the first iteration we return a fraction of the first page
+// so out_paddr will be aligned on subsequent iterations
+// max_length is required to be a positive multiple of PAGE_SIZE
+bool iotxn_phys_iter_next(iotxn_phys_iter_t* iter, size_t max_length, mx_paddr_t* out_paddr,
+                          size_t* out_length);
 
 __END_CDECLS;
